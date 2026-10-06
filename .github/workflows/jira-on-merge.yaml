@@ -1,0 +1,46 @@
+name: Jira on merge
+
+# Moves the Jira issue named in a merged pull request's head branch to done,
+# through a Jira Automation incoming webhook. A plain GitHub webhook cannot send
+# the token header that trigger requires, so the call is made from a job.
+on:
+  workflow_call:
+    inputs:
+      key-pattern:
+        description: Extended regex for the issue key in the head branch name
+        type: string
+        default: "EV-[0-9]+"
+    secrets:
+      JIRA_MERGE_WEBHOOK_URL:
+        required: true
+      JIRA_MERGE_WEBHOOK_TOKEN:
+        required: true
+
+permissions: {}
+
+jobs:
+  transition:
+    # Only a merge into the default branch counts; a stacked pull request merged
+    # into another branch is not done yet.
+    if: >-
+      github.event.pull_request.merged == true
+      && github.event.pull_request.base.ref == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Transition the branch's issue
+        env:
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          PATTERN: ${{ inputs.key-pattern }}
+          URL: ${{ secrets.JIRA_MERGE_WEBHOOK_URL }}
+          TOKEN: ${{ secrets.JIRA_MERGE_WEBHOOK_TOKEN }}
+        run: |
+          key=$(printf '%s' "$BRANCH" | grep -oE "$PATTERN" | head -n1 || true)
+          if [ -z "$key" ]; then
+            echo "No issue key in $BRANCH, nothing to do."
+            exit 0
+          fi
+          curl --fail -sS -X POST "$URL" \
+            -H "Content-Type: application/json" \
+            -H "X-Automation-Webhook-Token: $TOKEN" \
+            -d "{\"issues\":[\"$key\"]}"
+          echo "Sent $key."
