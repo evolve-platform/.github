@@ -23,8 +23,7 @@ jobs:
     # Only a merge into the default branch counts; a stacked pull request merged
     # into another branch is not done yet.
     if: >-
-      github.event.pull_request.merged == true
-      && github.event.pull_request.base.ref == github.event.repository.default_branch
+      github.event.pull_request.base.ref == github.event.repository.default_branch
     runs-on: ubuntu-latest
     steps:
       - name: Transition the branch's issue
