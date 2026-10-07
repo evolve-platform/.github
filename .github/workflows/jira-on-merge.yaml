@@ -1,8 +1,10 @@
 name: Jira on merge
 
-# Moves the Jira issue named in a merged pull request's head branch to done,
-# through a Jira Automation incoming webhook. A plain GitHub webhook cannot send
-# the token header that trigger requires, so the call is made from a job.
+# Tells Jira about a pull request into the default branch through a Jira
+# Automation incoming webhook: the issue named in the head branch, the event's
+# action and whether the pull request was merged, so the rule decides what to do.
+# A plain GitHub webhook cannot send the token header that trigger requires, so
+# the call is made from a job.
 on:
   workflow_call:
     inputs:
@@ -20,8 +22,7 @@ permissions: {}
 
 jobs:
   transition:
-    # Only a merge into the default branch counts; a stacked pull request merged
-    # into another branch is not done yet.
+    # A stacked pull request into another branch says nothing about the issue yet.
     if: >-
       github.event.pull_request.base.ref == github.event.repository.default_branch
     runs-on: ubuntu-latest
@@ -29,6 +30,9 @@ jobs:
       - name: Transition the branch's issue
         env:
           BRANCH: ${{ github.event.pull_request.head.ref }}
+          ACTION: ${{ github.event.action }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          BASE: ${{ github.event.pull_request.base.ref }}
           PATTERN: ${{ inputs.key-pattern }}
           URL: ${{ secrets.JIRA_MERGE_WEBHOOK_URL }}
           TOKEN: ${{ secrets.JIRA_MERGE_WEBHOOK_TOKEN }}
@@ -47,5 +51,6 @@ jobs:
           curl --fail -sS -X POST "$URL" \
             -H "Content-Type: application/json" \
             -H "X-Automation-Webhook-Token: $TOKEN" \
-            -d "{\"issues\":[\"$key\"]}"
-          echo "Sent $key."
+            -d "$(jq -cn --arg key "$key" --arg action "$ACTION" --arg base "$BASE" --argjson merged "${MERGED:-false}" \
+              '{issues: [$key], action: $action, pull_request: {merged: $merged, base: {ref: $base}}}')"
+          echo "Sent $key ($ACTION, merged=$MERGED)."
