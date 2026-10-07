@@ -34,6 +34,12 @@ jobs:
           URL: ${{ secrets.JIRA_MERGE_WEBHOOK_URL }}
           TOKEN: ${{ secrets.JIRA_MERGE_WEBHOOK_TOKEN }}
         run: |
+          # A caller that passes the secrets from an org secret its repository
+          # cannot see sends empty strings, which `required` does not catch.
+          if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
+            echo "::error::JIRA_MERGE_WEBHOOK_URL or JIRA_MERGE_WEBHOOK_TOKEN is empty; check that the org secrets exist and are shared with ${GITHUB_REPOSITORY}."
+            exit 1
+          fi
           key=$(printf '%s' "$BRANCH" | grep -oE "$PATTERN" | head -n1 || true)
           if [ -z "$key" ]; then
             echo "No issue key in $BRANCH, nothing to do."
