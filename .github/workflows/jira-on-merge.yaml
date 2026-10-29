@@ -1,8 +1,8 @@
 name: Jira on merge
 
-# Moves the Jira issue named in a merged pull request's head branch to done,
-# through a Jira Automation incoming webhook. A plain GitHub webhook cannot send
-# the token header that trigger requires, so the call is made from a job.
+# Follows a pull request on the Jira issue named in its head branch, with the
+# Atlassian CLI: an opened pull request moves the issue to Actief, a merged one
+# to Gereed, and a subtask's parent follows once all its subtasks are done.
 on:
   workflow_call:
     inputs:
@@ -10,42 +10,184 @@ on:
         description: Extended regex for the issue key in the head branch name
         type: string
         default: "EV-[0-9]+"
+      jira-site:
+        description: The Jira Cloud site the issues live on
+        type: string
+        default: labdigital.atlassian.net
     secrets:
+      JIRA_EMAIL:
+        required: false
+      JIRA_API_TOKEN:
+        required: false
+      # Ignored. Still declared so a caller that passes them keeps starting
+      # until it has switched to the two secrets above.
       JIRA_MERGE_WEBHOOK_URL:
-        required: true
+        required: false
       JIRA_MERGE_WEBHOOK_TOKEN:
+        required: false
+  # The same job by hand, to test the credentials and the transitions.
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Head branch name holding the issue key
+        type: string
         required: true
+      pr-url:
+        description: Pull request URL to comment on the issue
+        type: string
+        required: true
+      event:
+        description: What happened to the pull request
+        type: choice
+        options: [opened, merged]
+        default: merged
+      partial:
+        description: Act as if the pull request has the partial label
+        type: boolean
+        default: false
 
 permissions: {}
 
+env:
+  ACLI_VERSION: 1.3.39-stable
+  ACLI_SHA256: 7e0fb4dbedb1bb9100f8dc854d31d43c4b7c2c740e4cfd83b750760f4957b5a5
+  ACTIVE_STATUS: Actief
+  DONE_STATUS: Gereed
+
 jobs:
   transition:
-    # Only a merge into the default branch counts; a stacked pull request merged
-    # into another branch is not done yet.
+    # Only a pull request into the default branch counts; a stacked pull
+    # request merged into another branch is not done yet.
     if: >-
-      github.event.pull_request.base.ref == github.event.repository.default_branch
+      github.event_name == 'workflow_dispatch'
+      || github.event.pull_request.base.ref == github.event.repository.default_branch
     runs-on: ubuntu-latest
     steps:
-      - name: Transition the branch's issue
+      - name: Find the issue and what to do with it
+        id: plan
         env:
-          BRANCH: ${{ github.event.pull_request.head.ref }}
-          PATTERN: ${{ inputs.key-pattern }}
-          URL: ${{ secrets.JIRA_MERGE_WEBHOOK_URL }}
-          TOKEN: ${{ secrets.JIRA_MERGE_WEBHOOK_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          DISPATCH_EVENT: ${{ inputs.event }}
+          BRANCH: ${{ github.event.pull_request.head.ref || inputs.branch }}
+          PATTERN: ${{ inputs.key-pattern || 'EV-[0-9]+' }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: |
           # A caller that passes the secrets from an org secret its repository
           # cannot see sends empty strings, which `required` does not catch.
-          if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
-            echo "::error::JIRA_MERGE_WEBHOOK_URL or JIRA_MERGE_WEBHOOK_TOKEN is empty; check that the org secrets exist and are shared with ${GITHUB_REPOSITORY}."
+          if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_API_TOKEN" ]; then
+            echo "::error::JIRA_EMAIL or JIRA_API_TOKEN is empty; check that the org secrets exist, are shared with ${GITHUB_REPOSITORY}, and are passed to this workflow."
             exit 1
+          fi
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            event=$DISPATCH_EVENT
+          elif [ "$ACTION" = closed ] && [ "$MERGED" = true ]; then
+            event=merged
+          elif [ "$ACTION" = opened ] || [ "$ACTION" = reopened ]; then
+            event=opened
+          else
+            echo "Pull request $ACTION without a merge, nothing to do."
+            exit 0
           fi
           key=$(printf '%s' "$BRANCH" | grep -oE "$PATTERN" | head -n1 || true)
           if [ -z "$key" ]; then
             echo "No issue key in $BRANCH, nothing to do."
             exit 0
           fi
-          curl --fail -sS -X POST "$URL" \
-            -H "Content-Type: application/json" \
-            -H "X-Automation-Webhook-Token: $TOKEN" \
-            -d "{\"issues\":[\"$key\"]}"
-          echo "Sent $key."
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "event=$event" >> "$GITHUB_OUTPUT"
+
+      - name: Install the Atlassian CLI
+        if: steps.plan.outputs.key
+        run: |
+          archive="$RUNNER_TEMP/acli.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://acli.atlassian.com/linux/${ACLI_VERSION}/acli_${ACLI_VERSION}_linux_amd64.tar.gz"
+          echo "$ACLI_SHA256  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          install -D "$RUNNER_TEMP/acli_${ACLI_VERSION}_linux_amd64/acli" "$RUNNER_TEMP/bin/acli"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Log in to Jira
+        if: steps.plan.outputs.key
+        env:
+          SITE: ${{ inputs.jira-site || 'labdigital.atlassian.net' }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: printf '%s' "$JIRA_API_TOKEN" | acli jira auth login --site "$SITE" --email "$JIRA_EMAIL" --token
+
+      - name: Update the issue
+        if: steps.plan.outputs.key
+        env:
+          KEY: ${{ steps.plan.outputs.key }}
+          EVENT: ${{ steps.plan.outputs.event }}
+          PR_URL: ${{ github.event.pull_request.html_url || inputs.pr-url }}
+          PARTIAL: ${{ contains(github.event.pull_request.labels.*.name, 'partial') || inputs.partial }}
+        run: |
+          set -euo pipefail
+
+          view() { acli jira workitem view "$1" --json --fields "$2"; }
+          category() { view "$1" status | jq -r '.fields.status.statusCategory.key'; }
+
+          # A rerun must not stack comments, so an identical one is skipped.
+          comment() {
+            local text="$1$PR_URL" adf
+            if view "$KEY" comment | jq -e --arg t "$text" \
+              '[.fields.comment.comments[]?.body | [.. | .text? // empty] | join("")] | index($t)' >/dev/null; then
+              echo "$KEY already has the comment: $text"
+              return
+            fi
+            adf=$(jq -nc --arg p "$1" --arg u "$PR_URL" '{type: "doc", version: 1, content: [{type: "paragraph",
+              content: [{type: "text", text: $p}, {type: "text", text: $u, marks: [{type: "link", attrs: {href: $u}}]}]}]}')
+            acli jira workitem comment create --key "$KEY" --body "$adf"
+          }
+
+          # Only an issue nobody started moves to active, so a rerun or a
+          # reopened pull request never pulls a finished issue back.
+          start() {
+            if [ "$(category "$1")" != new ]; then
+              echo "$1 is already started."
+              return
+            fi
+            acli jira workitem transition --key "$1" --status "$ACTIVE_STATUS" --yes
+          }
+
+          # Any done status counts, so a WONTFIX issue is not turned into Gereed.
+          finish() {
+            if [ "$(category "$1")" = "done" ]; then
+              echo "$1 is already done."
+              return
+            fi
+            acli jira workitem transition --key "$1" --status "$DONE_STATUS" --yes
+          }
+
+          # Jira also reports an epic as a story's parent; only a subtask's parent follows it.
+          parent=$(view "$KEY" parent,issuetype \
+            | jq -r 'select(.fields.issuetype.subtask) | .fields.parent.key // empty')
+
+          if [ "$EVENT" = opened ]; then
+            comment "Pull request opened: "
+            start "$KEY"
+            if [ -n "$parent" ]; then start "$parent"; fi
+            exit 0
+          fi
+
+          if [ "$PARTIAL" = true ]; then
+            comment "Pull request merged with the partial label, so the issue stays open: "
+            exit 0
+          fi
+          comment "Pull request merged: "
+          finish "$KEY"
+          if [ -z "$parent" ]; then exit 0; fi
+
+          # The search index lags behind the transition above, so this issue is
+          # taken as done rather than read back.
+          open=$(acli jira workitem search --jql "parent = $parent" --fields key,status --json --paginate \
+            | jq -r --arg k "$KEY" '[.[] | select(.key != $k and .fields.status.statusCategory.key != "done") | .key] | join(" ")')
+          if [ -n "$open" ]; then
+            echo "$parent still has open subtasks: $open"
+            exit 0
+          fi
+          finish "$parent"
